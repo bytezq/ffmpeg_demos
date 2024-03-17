@@ -8,6 +8,8 @@ include_directories(ffmpeg-n4.4.1-msvc/include)
 # 指定库文件搜索路径
 link_directories(ffmpeg-n4.4.1-msvc/bin)
 
+SET(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/../bin)
+
 # 用于创建可执行文件
 add_executable(${PROJECT_NAME} merge.c)
 
