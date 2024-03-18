@@ -3,7 +3,16 @@
 #include "libavfilter/avfilter.h"
 #include "libavfilter/buffersrc.h"
 #include "libavfilter/buffersink.h"
+#include "libavcodec/avcodec.h"
+#include "libswscale/swscale.h"
+#include "libswresample/swresample.h"
+#include "libavdevice/avdevice.h"
 #include "libavutil/bprint.h"
+#include "libavutil/audio_fifo.h"
+#include "libavutil/fifo.h"
+#include "libavutil/avutil.h"
+#include "libavutil/frame.h"
+#include "libavutil/imgutils.h"
 
 
 AVFormatContext* input_fmt_ctx;
@@ -20,6 +29,8 @@ AVFilterInOut* cur;
 
 AVFilterContext* buffersrc_ctx;
 AVFilterContext* buffersink_ctx;
+
+
 
 static int open_intput_file(const char* filename) {
     int ret = 0, err;
@@ -183,9 +194,12 @@ int main()
 
     AVFrame* result_frame = av_frame_alloc();
 
-    AVPacket* pkt = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
+    AVPacket* input_pkt = av_packet_alloc();
+    AVFrame* input_frame = av_frame_alloc();
     AVPacket* pkt_out = av_packet_alloc();
+    
+    // 申请管道用于缓冲帧数据
+    AVFifoBuffer *video_fifo = av_fifo_alloc(30 * sizeof(input_frame));  //申请30帧缓存
 
     int frame_num = 0;
     int read_end = 0;
@@ -194,15 +208,15 @@ int main()
             break;
         }
         // 读取编码数据
-        ret = av_read_frame(input_fmt_ctx, pkt);
+        ret = av_read_frame(input_fmt_ctx, input_pkt);
         //跳过不处理音频包
-        if (1 == pkt->stream_index) {
-            av_packet_unref(pkt);
+        if (1 == input_pkt->stream_index) {
+            av_packet_unref(input_pkt);
             continue;
         }
 
         if (AVERROR_EOF == ret) {
-            //读取完文件，这时候 pkt 的 data 跟 size 应该是 null
+            //读取完文件，这时候 input_pkt 的 data 跟 size 应该是 null
             avcodec_send_packet(input_codec_ctx, NULL);
         }
         else {
@@ -213,26 +227,26 @@ int main()
             else {
             retry:
                 // 将编码数据发送到解码器
-                if (avcodec_send_packet(input_codec_ctx, pkt) == AVERROR(EAGAIN)) {
+                if (avcodec_send_packet(input_codec_ctx, input_pkt) == AVERROR(EAGAIN)) {
                     printf("Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
                     //这里可以考虑休眠 0.1 秒，返回 EAGAIN 通常是 ffmpeg 的内部 api 有bug
                     // 发送失败就重新发送
                     goto retry;
                 }
-                //释放 pkt 里面的编码数据
-                av_packet_unref(pkt);
+                //释放 input_pkt 里面的编码数据
+                av_packet_unref(input_pkt);
             }
         }
 
         //循环不断从解码器读数据，直到没有数据可读。
         for (;;) {
             //读取 AVFrame
-            ret = avcodec_receive_frame(input_codec_ctx, frame);
-            /* 释放 frame 里面的YUV数据，
+            ret = avcodec_receive_frame(input_codec_ctx, input_frame);
+            /* 释放 input_frame 里面的YUV数据，
              * 由于 avcodec_receive_frame 函数里面会调用 av_frame_unref，所以下面的代码可以注释。
              * 所以我们不需要 手动 unref 这个 AVFrame
              */
-             //av_frame_unref(frame);
+             //av_frame_unref(input_frame);
 
             if (AVERROR(EAGAIN) == ret) {
                 //提示 EAGAIN 代表解码器需要更多的 AVPacket，跳出当前for，让解码器拿到更多的 AVPacket
@@ -281,12 +295,15 @@ int main()
                 break;
             }
             else if (ret >= 0) {
-
+                // 写入管道，浅拷贝帧数据
+                AVFrame* tmp1 = av_frame_alloc();
+                av_frame_move_ref(tmp1, input_frame);
+                if (av_fifo_space(video_fifo) >= sizeof(tmp1)) {
+					av_fifo_generic_write(video_fifo, &tmp1, sizeof(tmp1), NULL);
+				}
 
                 if (NULL == filter_graph) {
-                    
                     init_filter_graph();
-
                     init_input_filters(); // 根据字符串初始化输入滤镜，初始化inputs 和 outputs
                     
                     // 初始化buffersrc滤镜
@@ -301,11 +318,17 @@ int main()
                         printf("Cannot configure graph\n");
                         return ret;
                     }
-
-
                 }
 
-                ret = av_buffersrc_add_frame_flags(buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_PUSH);
+                // 从管道读取数据到buffer
+                AVFrame* tmp;
+                if (av_fifo_size(video_fifo) >= sizeof(tmp)) {
+                    av_fifo_generic_read(video_fifo, &tmp, sizeof(tmp), NULL);
+                }else{
+                    break;
+                }
+                ret = av_buffersrc_add_frame_flags(buffersrc_ctx, tmp, AV_BUFFERSRC_FLAG_PUSH);
+                av_frame_free(&tmp);
                 if (ret < 0) {
                     printf("Error: av_buffersrc_add_frame failed\n");
                     return ret;
@@ -421,9 +444,9 @@ int main()
 
     }
 
-    av_frame_free(&frame);
+    av_frame_free(&input_frame);
     av_frame_free(&result_frame);
-    av_packet_free(&pkt);
+    av_packet_free(&input_pkt);
     av_packet_free(&pkt_out);
 
 

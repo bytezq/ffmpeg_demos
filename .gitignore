@@ -112,5 +112,7 @@ build.ninja
 /.cache/
 
 # Visual Studio files
-/.vs/
-/out/
+.vs/
+out/
+bin/
+
